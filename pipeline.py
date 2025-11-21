@@ -397,6 +397,32 @@ def health():
         'total_nodes': TOTAL_NODES
     }), 200
 
+def run_gateway():
+    # current queue/worker + /query routes
+    host = NODE_0_IP.split(":")[0]
+    port = int(NODE_0_IP.split(":")[1]) if ":" in NODE_0_IP else 8000
+    app.run(host=host, port=port, threaded=True)
+
+
+def run_retriever():
+    app = Flask("retriever")
+
+    @app.route("/retrieve", methods=["POST"])
+    def retrieve():
+        return jsonify({"error": "stub"}), 501
+
+    app.run(host=NODE_1_IP.split(":")[0], port=int(NODE_1_IP.split(":")[1]))
+
+
+def run_generator():
+    app = Flask("generator")
+
+    @app.route("/generate", methods=["POST"])
+    def generate():
+        return jsonify({"error": "stub"}), 501
+
+    app.run(host=NODE_2_IP.split(":")[0], port=int(NODE_2_IP.split(":")[1]))
+
 
 def main():
     """
@@ -430,4 +456,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if NODE_NUMBER == 0:
+        run_gateway()
+    elif NODE_NUMBER == 1:
+        run_retriever()
+    elif NODE_NUMBER == 2:
+        run_generator()
+    else:
+        raise ValueError("unexpected NODE_NUMBER")
+    # main()
