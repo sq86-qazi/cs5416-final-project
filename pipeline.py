@@ -107,12 +107,7 @@ class MonolithicPipeline:
         elif NODE_NUMBER == 1:
             print("Loading FAISS index and reranker for Node 1...")
             self.db_path = f"{CONFIG['documents_path']}/documents.db"
-            self.connection_pool = Queue(maxsize=4)
-
-            # Pre-populate pool with 4 connections
-            for _ in range(4):
-                conn = sqlite3.connect(self.db_path)
-                self.connection_pool.put(conn)
+            self.thread_local = threading.local()
             # Load FAISS index
             if os.path.exists(CONFIG["faiss_index_path"]):
                 print("Loading FAISS index...")
@@ -192,7 +187,7 @@ class MonolithicPipeline:
         def fetch_one_query_docs(doc_ids):
             """Fetch documents for a single query using pooled connection"""
             # Get connection from pool (blocks if pool is empty)
-            conn = self.connection_pool.get()
+            conn = sqlite3.connect(self.db_path)
             try:
                 cursor = conn.cursor()
                 documents = []
@@ -214,7 +209,7 @@ class MonolithicPipeline:
                 return documents
             finally:
                 # Always return connection to pool for reuse
-                self.connection_pool.put(conn)
+                conn.close()
 
         # Parallelize fetching for multiple queries
         max_workers = min(4, len(doc_id_batches))  # I/O-bound: 4 workers is good
