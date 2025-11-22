@@ -94,71 +94,6 @@ class MonolithicPipeline:
         self.sentiment_classifier = None
         self.safety_classifier = None
 
-        # Node 0: Frontend + embedder + orchestration
-        if NODE_NUMBER == 0:
-            print("Loading embedding model for Node 0...")
-            self.embedding_model = SentenceTransformer(self.embedding_model_name).to(
-                self.device
-            )
-            self.embedding_model.eval()
-            print("Embedding model loaded!")
-
-        # Node 1: FAISS + document retrieval + reranking
-        elif NODE_NUMBER == 1:
-            print("Loading FAISS index and reranker for Node 1...")
-
-            # Load FAISS index
-            if os.path.exists(CONFIG["faiss_index_path"]):
-                print("Loading FAISS index...")
-                self.faiss_index = faiss.read_index(CONFIG["faiss_index_path"])
-                print("FAISS index loaded!")
-            else:
-                raise FileNotFoundError(
-                    f"FAISS index not found at {CONFIG['faiss_index_path']}"
-                )
-
-            # Load reranker
-            print("Loading reranker model...")
-            self.reranker_tokenizer = AutoTokenizer.from_pretrained(
-                self.reranker_model_name
-            )
-            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
-                self.reranker_model_name
-            ).to(self.device)
-            self.reranker_model.eval()
-            print("Reranker model loaded!")
-
-        # Node 2: LLM + sentiment + sensitivity filters
-        elif NODE_NUMBER == 2:
-            print("Loading LLM, sentiment, and safety models for Node 2...")
-
-            # Load LLM
-            print("Loading LLM model...")
-            try:
-                # Try torch_dtype (newer transformers API)
-                self.llm_model = AutoModelForCausalLM.from_pretrained(
-                    self.llm_model_name,
-                    torch_dtype=torch.float16,
-                ).to(self.device)
-            except TypeError:
-                # Fallback for older transformers versions
-                print("Using fallback method for LLM loading...")
-                self.llm_model = AutoModelForCausalLM.from_pretrained(
-                    self.llm_model_name
-                ).to(self.device)
-                self.llm_model = self.llm_model.half()  # Convert to float16
-
-            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
-            print("LLM model loaded!")
-
-            # Sentiment and safety models will be loaded lazily when needed
-            # (They're initialized as None above)
-
-        else:
-            raise ValueError(f"Invalid NODE_NUMBER: {NODE_NUMBER}. Must be 0, 1, or 2.")
-
-        print(f"Node {NODE_NUMBER} initialization complete!")
-
     def process_request(self, request: PipelineRequest) -> PipelineResponse:
         """
         Backwards-compatible single-request entry point that delegates
@@ -233,7 +168,15 @@ class MonolithicPipeline:
 
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         if self.embedding_model is None:
-            raise RuntimeError("Embedding model not loaded on this node")
+            if NODE_NUMBER != 0:
+                raise RuntimeError("Embedding model not available on this node")
+            print("Loading embedding model...")
+            self.embedding_model = SentenceTransformer(self.embedding_model_name).to(
+                self.device
+            )
+            self.embedding_model.eval()
+            print("Embedding model loaded!")
+
         with torch.no_grad():
             embeddings = self.embedding_model.encode(
                 texts, normalize_embeddings=True, convert_to_numpy=True
@@ -243,7 +186,16 @@ class MonolithicPipeline:
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings"""
         if self.faiss_index is None:
-            raise FileNotFoundError("FAISS index not loaded")
+            if NODE_NUMBER != 1:
+                raise RuntimeError("FAISS index not available on this node")
+            if not os.path.exists(CONFIG["faiss_index_path"]):
+                raise FileNotFoundError(
+                    f"FAISS index not found at {CONFIG['faiss_index_path']}"
+                )
+            print("Loading FAISS index...")
+            self.faiss_index = faiss.read_index(CONFIG["faiss_index_path"])
+            print("FAISS index loaded!")
+
         query_embeddings = query_embeddings.astype("float32")
         _, indices = self.faiss_index.search(query_embeddings, CONFIG["retrieval_k"])
         return [row.tolist() for row in indices]
@@ -282,7 +234,18 @@ class MonolithicPipeline:
     ) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
         if self.reranker_model is None or self.reranker_tokenizer is None:
-            raise RuntimeError("Reranker model not loaded on this node")
+            if NODE_NUMBER != 1:
+                raise RuntimeError("Reranker model not available on this node")
+            print("Loading reranker model...")
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(
+                self.reranker_model_name
+            )
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                self.reranker_model_name
+            ).to(self.device)
+            self.reranker_model.eval()
+            print("Reranker model loaded!")
+
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -295,9 +258,7 @@ class MonolithicPipeline:
                 ).to(self.device)
                 scores = (
                     self.reranker_model(**inputs, return_dict=True)
-                    .logits.view(
-                        -1,
-                    )
+                    .logits.view(-1)
                     .float()
                 )
             doc_scores = list(zip(documents, scores))
@@ -309,8 +270,27 @@ class MonolithicPipeline:
         self, queries: List[str], documents_batch: List[List[Dict]]
     ) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
+        # Lazy load LLM model on first use
         if self.llm_model is None or self.llm_tokenizer is None:
-            raise RuntimeError("LLM model not loaded on this node")
+            if NODE_NUMBER != 2:
+                raise RuntimeError("LLM model not available on this node")
+            print("Loading LLM model...")
+            try:
+                # Try torch_dtype (newer transformers API)
+                self.llm_model = AutoModelForCausalLM.from_pretrained(
+                    self.llm_model_name,
+                    torch_dtype=torch.float16,
+                ).to(self.device)
+            except TypeError:
+                # Fallback for older transformers versions
+                print("Using fallback method for LLM loading...")
+                self.llm_model = AutoModelForCausalLM.from_pretrained(
+                    self.llm_model_name
+                ).to(self.device)
+                self.llm_model = self.llm_model.half()  # Convert to float16
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+            print("LLM model loaded!")
+
         responses = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join(
@@ -332,12 +312,13 @@ class MonolithicPipeline:
             model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(
                 self.device
             )
-            generated_ids = self.llm_model.generate(
-                **model_inputs,
-                max_new_tokens=CONFIG["max_tokens"],
-                temperature=0.01,
-                pad_token_id=self.llm_tokenizer.eos_token_id,
-            )
+            with torch.no_grad():
+                generated_ids = self.llm_model.generate(
+                    **model_inputs,
+                    max_new_tokens=CONFIG["max_tokens"],
+                    temperature=0.01,
+                    pad_token_id=self.llm_tokenizer.eos_token_id,
+                )
             generated_ids = [
                 output_ids[len(input_ids) :]
                 for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -351,11 +332,15 @@ class MonolithicPipeline:
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
         if self.sentiment_classifier is None:
+            if NODE_NUMBER != 2:
+                raise RuntimeError("Sentiment classifier not available on this node")
+            print("Loading sentiment classifier...")
             self.sentiment_classifier = hf_pipeline(
                 "sentiment-analysis",
                 model=self.sentiment_model_name,
                 device=self.device,
             )
+            print("Sentiment classifier loaded!")
         truncated_texts = [text[: CONFIG["truncate_length"]] for text in texts]
         raw_results = self.sentiment_classifier(truncated_texts)
         sentiment_map = {
@@ -373,9 +358,13 @@ class MonolithicPipeline:
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
         if self.safety_classifier is None:
+            if NODE_NUMBER != 2:
+                raise RuntimeError("Safety classifier not available on this node")
+            print("Loading safety classifier...")
             self.safety_classifier = hf_pipeline(
                 "text-classification", model=self.safety_model_name, device=self.device
             )
+            print("Safety classifier loaded!")
         truncated_texts = [text[: CONFIG["truncate_length"]] for text in texts]
         raw_results = self.safety_classifier(truncated_texts)
         toxicity_flags = []
@@ -517,9 +506,12 @@ def run_retriever():
         request_ids = [data.get("request_id")]
         queries = [data.get("query")]
         embeddings = data.get("embeddings")
-        if not isinstance(embeddings, list):
-            embeddings = [embeddings]  # Handle single embedding case
-        embeddings_array = np.array(embeddings, dtype=np.float32)
+        if isinstance(embeddings, list) and len(embeddings) > 0:
+            if isinstance(embeddings[0], (int, float)):
+                embeddings = [embeddings]
+            embeddings_array = np.array(embeddings, dtype=np.float32)
+        else:
+            raise ValueError("Invalid embeddings format")
 
         doc_id_batches = pipeline._faiss_search_batch(embeddings_array)
         documents_batch = pipeline._fetch_documents_batch(doc_id_batches)
