@@ -84,6 +84,38 @@ class MonolithicPipeline:
         self.llm_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
         self.sentiment_model_name = "nlptown/bert-base-multilingual-uncased-sentiment"
         self.safety_model_name = "unitary/toxic-bert"
+        self.embedding_model = SentenceTransformer(self.embedding_model_name).to(
+            self.device
+        )
+        self.embedding_model.eval()  # Set to eval mode
+
+        # Load FAISS index ONCE
+        if os.path.exists(CONFIG["faiss_index_path"]):
+            print("Loading FAISS index...")
+            self.faiss_index = faiss.read_index(CONFIG["faiss_index_path"])
+            print("FAISS index loaded!")
+        else:
+            self.faiss_index = None
+
+        # Load reranker ONCE
+        self.reranker_tokenizer = AutoTokenizer.from_pretrained(
+            self.reranker_model_name
+        )
+        self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
+            self.reranker_model_name
+        ).to(self.device)
+        self.reranker_model.eval()
+
+        # Load LLM ONCE
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
+            self.llm_model_name,
+            dtype=torch.float16,
+        ).to(self.device)
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+
+        # Sentiment and safety models loaded lazily or at init
+        self.sentiment_classifier = None
+        self.safety_classifier = None
 
     def process_request(self, request: PipelineRequest) -> PipelineResponse:
         """
@@ -159,27 +191,18 @@ class MonolithicPipeline:
 
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
-        model = SentenceTransformer(self.embedding_model_name).to(self.device)
-        embeddings = model.encode(
-            texts, normalize_embeddings=True, convert_to_numpy=True
-        )
-        del model
-        gc.collect()
+        with torch.no_grad():
+            embeddings = self.embedding_model.encode(
+                texts, normalize_embeddings=True, convert_to_numpy=True
+            )
         return embeddings
 
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings"""
-        if not os.path.exists(CONFIG["faiss_index_path"]):
-            raise FileNotFoundError(
-                "FAISS index not found. Please create the index before running the pipeline."
-            )
-
-        print("Loading FAISS index")
-        index = faiss.read_index(CONFIG["faiss_index_path"])
+        if self.faiss_index is None:
+            raise FileNotFoundError("FAISS index not loaded")
         query_embeddings = query_embeddings.astype("float32")
-        _, indices = index.search(query_embeddings, CONFIG["retrieval_k"])
-        del index
-        gc.collect()
+        _, indices = self.faiss_index.search(query_embeddings, CONFIG["retrieval_k"])
         return [row.tolist() for row in indices]
 
     def _fetch_documents_batch(
@@ -215,11 +238,6 @@ class MonolithicPipeline:
         self, queries: List[str], documents_batch: List[List[Dict]]
     ) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
-        tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            self.reranker_model_name
-        ).to(self.device)
-        model.eval()
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -227,15 +245,11 @@ class MonolithicPipeline:
                 continue
             pairs = [[query, doc["content"]] for doc in documents]
             with torch.no_grad():
-                inputs = tokenizer(
-                    pairs,
-                    padding=True,
-                    truncation=True,
-                    return_tensors="pt",
-                    max_length=CONFIG["truncate_length"],
+                inputs = self.reranker_tokenizer(
+                    pairs, padding=True, truncation=True, return_tensors="pt"
                 ).to(self.device)
                 scores = (
-                    model(**inputs, return_dict=True)
+                    self.reranker_model(**inputs, return_dict=True)
                     .logits.view(
                         -1,
                     )
@@ -244,19 +258,12 @@ class MonolithicPipeline:
             doc_scores = list(zip(documents, scores))
             doc_scores.sort(key=lambda x: x[1], reverse=True)
             reranked_batches.append([doc for doc, _ in doc_scores])
-        del model, tokenizer
-        gc.collect()
         return reranked_batches
 
     def _generate_responses_batch(
         self, queries: List[str], documents_batch: List[List[Dict]]
     ) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
-        model = AutoModelForCausalLM.from_pretrained(
-            self.llm_model_name,
-            dtype=torch.float16,
-        ).to(self.device)
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
         responses = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join(
@@ -272,15 +279,17 @@ class MonolithicPipeline:
                     "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:",
                 },
             ]
-            text = tokenizer.apply_chat_template(
+            text = self.llm_tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(
+                self.device
+            )
             generated_ids = model.generate(
                 **model_inputs,
                 max_new_tokens=CONFIG["max_tokens"],
                 temperature=0.01,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=self.llm_tokenizer.eos_token_id,
             )
             generated_ids = [
                 output_ids[len(input_ids) :]
@@ -290,15 +299,16 @@ class MonolithicPipeline:
                 0
             ]
             responses.append(response)
-        del model, tokenizer
-        gc.collect()
         return responses
 
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
-        classifier = hf_pipeline(
-            "sentiment-analysis", model=self.sentiment_model_name, device=self.device
-        )
+        if self.sentiment_classifier is None:
+            self.sentiment_classifier = hf_pipeline(
+                "sentiment-analysis",
+                model=self.sentiment_model_name,
+                device=self.device,
+            )
         truncated_texts = [text[: CONFIG["truncate_length"]] for text in texts]
         raw_results = classifier(truncated_texts)
         sentiment_map = {
@@ -311,22 +321,19 @@ class MonolithicPipeline:
         sentiments = []
         for result in raw_results:
             sentiments.append(sentiment_map.get(result["label"], "neutral"))
-        del classifier
-        gc.collect()
         return sentiments
 
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
-        classifier = hf_pipeline(
-            "text-classification", model=self.safety_model_name, device=self.device
-        )
+        if self.safety_classifier is None:
+            self.safety_classifier = hf_pipeline(
+                "text-classification", model=self.safety_model_name, device=self.device
+            )
         truncated_texts = [text[: CONFIG["truncate_length"]] for text in texts]
-        raw_results = classifier(truncated_texts)
+        raw_results = self.safety_classifier(truncated_texts)
         toxicity_flags = []
         for result in raw_results:
             toxicity_flags.append(result["score"] > 0.5)
-        del classifier
-        gc.collect()
         return toxicity_flags
 
 
@@ -444,6 +451,10 @@ def run_gateway():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    @app.route("/health", methods=["GET"])
+    def gateway_health():
+        return jsonify({"status": "healthy", "role": "gateway"}), 200
+
     host = NODE_0_IP.split(":")[0]
     port = int(NODE_0_IP.split(":")[1]) if ":" in NODE_0_IP else 8000
     app.run(host=host, port=port, threaded=True)
@@ -534,37 +545,6 @@ def run_generator():
     app.run(host=NODE_2_IP.split(":")[0], port=int(NODE_2_IP.split(":")[1]))
 
 
-def main():
-    """
-    Main execution function
-    """
-    global pipeline
-
-    print("=" * 60)
-    print("MONOLITHIC CUSTOMER SUPPORT PIPELINE")
-    print("=" * 60)
-    print(f"\nRunning on Node {NODE_NUMBER} of {TOTAL_NODES} nodes")
-    print(f"Node IPs: 0={NODE_0_IP}, 1={NODE_1_IP}, 2={NODE_2_IP}")
-    print("\nNOTE: This implementation is deliberately inefficient.")
-    print("Your task is to optimize this for a 3-node cluster.\n")
-
-    # Initialize pipeline
-    print("Initializing pipeline...")
-    pipeline = MonolithicPipeline()
-    print("Pipeline initialized!")
-
-    # Start worker thread
-    worker_thread = threading.Thread(target=process_requests_worker, daemon=True)
-    worker_thread.start()
-    print("Worker thread started!")
-
-    # Start Flask server
-    print(f"\nStarting Flask server")
-    hostname = NODE_0_IP.split(":")[0]
-    port = int(NODE_0_IP.split(":")[1]) if ":" in NODE_0_IP else 8000
-    app.run(host=hostname, port=port, threaded=True)
-
-
 if __name__ == "__main__":
     if NODE_NUMBER == 0:
         run_gateway()
@@ -574,4 +554,3 @@ if __name__ == "__main__":
         run_generator()
     else:
         raise ValueError("unexpected NODE_NUMBER")
-    # main()
