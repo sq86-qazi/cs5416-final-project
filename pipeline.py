@@ -93,7 +93,7 @@ class MonolithicPipeline:
         self.llm_tokenizer = None
         self.sentiment_classifier = None
         self.safety_classifier = None
-
+        self.db_conn = None
         # Node 0: Frontend + embedder + orchestration
         if NODE_NUMBER == 0:
             print("Loading embedding model for Node 0...")
@@ -159,78 +159,6 @@ class MonolithicPipeline:
 
         print(f"Node {NODE_NUMBER} initialization complete!")
 
-    def process_request(self, request: PipelineRequest) -> PipelineResponse:
-        """
-        Backwards-compatible single-request entry point that delegates
-        to the batch processor with a batch size of 1.
-        """
-        responses = self.process_batch([request])
-        return responses[0]
-
-    def process_batch(self, requests: List[PipelineRequest]) -> List[PipelineResponse]:
-        """
-        Main pipeline execution for a batch of requests.
-        """
-        if not requests:
-            return []
-
-        batch_size = len(requests)
-        start_times = [time.time() for _ in requests]
-        queries = [req.query for req in requests]
-
-        print("\n" + "=" * 60)
-        print(f"Processing batch of {batch_size} requests")
-        print("=" * 60)
-        for request in requests:
-            print(f"- {request.request_id}: {request.query[:50]}...")
-
-        # Step 1: Generate embeddings
-        print("\n[Step 1/7] Generating embeddings for batch...")
-        query_embeddings = self._generate_embeddings_batch(queries)
-
-        # Step 2: FAISS ANN search
-        print("\n[Step 2/7] Performing FAISS ANN search for batch...")
-        doc_id_batches = self._faiss_search_batch(query_embeddings)
-
-        # Step 3: Fetch documents from disk
-        print("\n[Step 3/7] Fetching documents for batch...")
-        documents_batch = self._fetch_documents_batch(doc_id_batches)
-
-        # Step 4: Rerank documents
-        print("\n[Step 4/7] Reranking documents for batch...")
-        reranked_docs_batch = self._rerank_documents_batch(queries, documents_batch)
-
-        # Step 5: Generate LLM responses
-        print("\n[Step 5/7] Generating LLM responses for batch...")
-        responses_text = self._generate_responses_batch(queries, reranked_docs_batch)
-
-        # Step 6: Sentiment analysis
-        print("\n[Step 6/7] Analyzing sentiment for batch...")
-        sentiments = self._analyze_sentiment_batch(responses_text)
-
-        # Step 7: Safety filter on responses
-        print("\n[Step 7/7] Applying safety filter to batch...")
-        toxicity_flags = self._filter_response_safety_batch(responses_text)
-
-        responses = []
-        for idx, request in enumerate(requests):
-            processing_time = time.time() - start_times[idx]
-            print(
-                f"\n✓ Request {request.request_id} processed in {processing_time:.2f} seconds"
-            )
-            sensitivity_result = "true" if toxicity_flags[idx] else "false"
-            responses.append(
-                PipelineResponse(
-                    request_id=request.request_id,
-                    generated_response=responses_text[idx],
-                    sentiment=sentiments[idx],
-                    is_toxic=sensitivity_result,
-                    processing_time=processing_time,
-                )
-            )
-
-        return responses
-
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         if self.embedding_model is None:
             raise RuntimeError("Embedding model not loaded on this node")
@@ -252,9 +180,9 @@ class MonolithicPipeline:
         self, doc_id_batches: List[List[int]]
     ) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
-        db_path = f"{CONFIG['documents_path']}/documents.db"
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        if self.db_conn is None:
+            self.db_conn = sqlite3.connect(f"{CONFIG['documents_path']}/documents.db")
+        cursor = self.db_conn.cursor()
         documents_batch = []
         for doc_ids in doc_id_batches:
             documents = []
@@ -274,7 +202,6 @@ class MonolithicPipeline:
                         }
                     )
             documents_batch.append(documents)
-        conn.close()
         return documents_batch
 
     def _rerank_documents_batch(
@@ -401,12 +328,10 @@ def run_gateway():
     def process_requests_worker():
         """Worker thread that processes requests from the queue"""
         BATCH_SIZE = 4
-        BATCH_TIMEOUT = 0.1
+        BATCH_TIMEOUT = 300
         while True:
             try:
                 batch = []
-                batch_start_time = time.time()
-
                 # Get first request (blocking)
                 first_request = request_queue.get()
                 if first_request is None:  # Shutdown signal
@@ -414,6 +339,7 @@ def run_gateway():
                 batch.append(first_request)
 
                 # Try to collect more requests (non-blocking with timeout)
+                batch_start_time = time.time()
                 while len(batch) < BATCH_SIZE:
                     try:
                         elapsed = time.time() - batch_start_time
