@@ -15,6 +15,7 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
 )
+from concurrent.futures import ThreadPoolExecutor
 from transformers import pipeline as hf_pipeline
 import warnings
 from sentence_transformers import SentenceTransformer
@@ -93,7 +94,6 @@ class MonolithicPipeline:
         self.llm_tokenizer = None
         self.sentiment_classifier = None
         self.safety_classifier = None
-        self.db_conn = None
         # Node 0: Frontend + embedder + orchestration
         if NODE_NUMBER == 0:
             print("Loading embedding model for Node 0...")
@@ -106,7 +106,13 @@ class MonolithicPipeline:
         # Node 1: FAISS + document retrieval + reranking
         elif NODE_NUMBER == 1:
             print("Loading FAISS index and reranker for Node 1...")
+            self.db_path = f"{CONFIG['documents_path']}/documents.db"
+            self.connection_pool = Queue(maxsize=4)
 
+            # Pre-populate pool with 4 connections
+            for _ in range(4):
+                conn = sqlite3.connect(self.db_path)
+                self.connection_pool.put(conn)
             # Load FAISS index
             if os.path.exists(CONFIG["faiss_index_path"]):
                 print("Loading FAISS index...")
@@ -180,28 +186,41 @@ class MonolithicPipeline:
         self, doc_id_batches: List[List[int]]
     ) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
-        if self.db_conn is None:
-            self.db_conn = sqlite3.connect(f"{CONFIG['documents_path']}/documents.db")
-        cursor = self.db_conn.cursor()
-        documents_batch = []
-        for doc_ids in doc_id_batches:
-            documents = []
-            for doc_id in doc_ids:
-                cursor.execute(
-                    "SELECT doc_id, title, content, category FROM documents WHERE doc_id = ?",
-                    (doc_id,),
-                )
-                result = cursor.fetchone()
-                if result:
-                    documents.append(
-                        {
-                            "doc_id": result[0],
-                            "title": result[1],
-                            "content": result[2],
-                            "category": result[3],
-                        }
+        if self.connection_pool is None:
+            raise RuntimeError("Connection pool not initialized")
+
+        def fetch_one_query_docs(doc_ids):
+            """Fetch documents for a single query using pooled connection"""
+            # Get connection from pool (blocks if pool is empty)
+            conn = self.connection_pool.get()
+            try:
+                cursor = conn.cursor()
+                documents = []
+                for doc_id in doc_ids:
+                    cursor.execute(
+                        "SELECT doc_id, title, content, category FROM documents WHERE doc_id = ?",
+                        (doc_id,),
                     )
-            documents_batch.append(documents)
+                    result = cursor.fetchone()
+                    if result:
+                        documents.append(
+                            {
+                                "doc_id": result[0],
+                                "title": result[1],
+                                "content": result[2],
+                                "category": result[3],
+                            }
+                        )
+                return documents
+            finally:
+                # Always return connection to pool for reuse
+                self.connection_pool.put(conn)
+
+        # Parallelize fetching for multiple queries
+        max_workers = min(4, len(doc_id_batches))  # I/O-bound: 4 workers is good
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            documents_batch = list(executor.map(fetch_one_query_docs, doc_id_batches))
+
         return documents_batch
 
     def _rerank_documents_batch(
@@ -210,26 +229,48 @@ class MonolithicPipeline:
         """Step 5: Rerank retrieved documents for each query in the batch"""
         if self.reranker_model is None or self.reranker_tokenizer is None:
             raise RuntimeError("Reranker model not loaded on this node")
-        reranked_batches = []
-        for query, documents in zip(queries, documents_batch):
+        reranker_tokenizer = self.reranker_tokenizer
+        reranker_model = self.reranker_model
+        # Lock for model access (PyTorch models may need serialization)
+        reranker_lock = threading.Lock()
+
+        def rerank_one_query(query, documents):
+            """Rerank documents for a single query"""
             if not documents:
-                reranked_batches.append([])
-                continue
+                return []
+
             pairs = [[query, doc["content"]] for doc in documents]
-            with torch.no_grad():
-                inputs = self.reranker_tokenizer(
-                    pairs, padding=True, truncation=True, return_tensors="pt"
-                ).to(self.device)
-                scores = (
-                    self.reranker_model(**inputs, return_dict=True)
-                    .logits.view(
-                        -1,
+
+            # Use lock to serialize model access
+            with reranker_lock:
+                with torch.no_grad():
+                    inputs = reranker_tokenizer(
+                        pairs,
+                        padding=True,
+                        truncation=True,
+                        return_tensors="pt",
+                        max_length=CONFIG["truncate_length"],
+                    ).to(self.device)
+                    scores = (
+                        reranker_model(**inputs, return_dict=True)
+                        .logits.view(-1)
+                        .float()
                     )
-                    .float()
-                )
+
+            # Sorting can happen outside the lock
             doc_scores = list(zip(documents, scores))
             doc_scores.sort(key=lambda x: x[1], reverse=True)
-            reranked_batches.append([doc for doc, _ in doc_scores])
+            return [doc for doc, _ in doc_scores]
+
+        # Parallelize reranking for multiple queries
+        num_cores = os.cpu_count() or 2
+        max_workers = min(num_cores, len(queries))  # CPU-bound: match CPU cores
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            reranked_batches = list(
+                executor.map(rerank_one_query, queries, documents_batch)
+            )
+
         return reranked_batches
 
     def _generate_responses_batch(
