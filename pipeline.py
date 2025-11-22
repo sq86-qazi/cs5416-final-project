@@ -181,8 +181,6 @@ class MonolithicPipeline:
         self, doc_id_batches: List[List[int]]
     ) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
-        if self.connection_pool is None:
-            raise RuntimeError("Connection pool not initialized")
 
         def fetch_one_query_docs(doc_ids):
             """Fetch documents for a single query using pooled connection"""
