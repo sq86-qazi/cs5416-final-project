@@ -84,38 +84,80 @@ class MonolithicPipeline:
         self.llm_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
         self.sentiment_model_name = "nlptown/bert-base-multilingual-uncased-sentiment"
         self.safety_model_name = "unitary/toxic-bert"
-        self.embedding_model = SentenceTransformer(self.embedding_model_name).to(
-            self.device
-        )
-        self.embedding_model.eval()  # Set to eval mode
-
-        # Load FAISS index ONCE
-        if os.path.exists(CONFIG["faiss_index_path"]):
-            print("Loading FAISS index...")
-            self.faiss_index = faiss.read_index(CONFIG["faiss_index_path"])
-            print("FAISS index loaded!")
-        else:
-            self.faiss_index = None
-
-        # Load reranker ONCE
-        self.reranker_tokenizer = AutoTokenizer.from_pretrained(
-            self.reranker_model_name
-        )
-        self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
-            self.reranker_model_name
-        ).to(self.device)
-        self.reranker_model.eval()
-
-        # Load LLM ONCE
-        self.llm_model = AutoModelForCausalLM.from_pretrained(
-            self.llm_model_name,
-            dtype=torch.float16,
-        ).to(self.device)
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
-
-        # Sentiment and safety models loaded lazily or at init
+        # Initialize all models to None
+        self.embedding_model = None
+        self.faiss_index = None
+        self.reranker_tokenizer = None
+        self.reranker_model = None
+        self.llm_model = None
+        self.llm_tokenizer = None
         self.sentiment_classifier = None
         self.safety_classifier = None
+
+        # Node 0: Frontend + embedder + orchestration
+        if NODE_NUMBER == 0:
+            print("Loading embedding model for Node 0...")
+            self.embedding_model = SentenceTransformer(self.embedding_model_name).to(
+                self.device
+            )
+            self.embedding_model.eval()
+            print("Embedding model loaded!")
+
+        # Node 1: FAISS + document retrieval + reranking
+        elif NODE_NUMBER == 1:
+            print("Loading FAISS index and reranker for Node 1...")
+
+            # Load FAISS index
+            if os.path.exists(CONFIG["faiss_index_path"]):
+                print("Loading FAISS index...")
+                self.faiss_index = faiss.read_index(CONFIG["faiss_index_path"])
+                print("FAISS index loaded!")
+            else:
+                raise FileNotFoundError(
+                    f"FAISS index not found at {CONFIG['faiss_index_path']}"
+                )
+
+            # Load reranker
+            print("Loading reranker model...")
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(
+                self.reranker_model_name
+            )
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                self.reranker_model_name
+            ).to(self.device)
+            self.reranker_model.eval()
+            print("Reranker model loaded!")
+
+        # Node 2: LLM + sentiment + sensitivity filters
+        elif NODE_NUMBER == 2:
+            print("Loading LLM, sentiment, and safety models for Node 2...")
+
+            # Load LLM
+            print("Loading LLM model...")
+            try:
+                # Try torch_dtype (newer transformers API)
+                self.llm_model = AutoModelForCausalLM.from_pretrained(
+                    self.llm_model_name,
+                    torch_dtype=torch.float16,
+                ).to(self.device)
+            except TypeError:
+                # Fallback for older transformers versions
+                print("Using fallback method for LLM loading...")
+                self.llm_model = AutoModelForCausalLM.from_pretrained(
+                    self.llm_model_name
+                ).to(self.device)
+                self.llm_model = self.llm_model.half()  # Convert to float16
+
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+            print("LLM model loaded!")
+
+            # Sentiment and safety models will be loaded lazily when needed
+            # (They're initialized as None above)
+
+        else:
+            raise ValueError(f"Invalid NODE_NUMBER: {NODE_NUMBER}. Must be 0, 1, or 2.")
+
+        print(f"Node {NODE_NUMBER} initialization complete!")
 
     def process_request(self, request: PipelineRequest) -> PipelineResponse:
         """
@@ -462,7 +504,7 @@ def run_gateway():
 
 def run_retriever():
     app = Flask("retriever")
-    pipeline = MonolithicPipeline()
+    pipeline: MonolithicPipeline = MonolithicPipeline()
 
     @app.route("/retrieve", methods=["POST"])
     def retrieve():
