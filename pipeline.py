@@ -232,7 +232,8 @@ class MonolithicPipeline:
         return responses
 
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
-        """Step 2: Generate embeddings for a batch of queries"""
+        if self.embedding_model is None:
+            raise RuntimeError("Embedding model not loaded on this node")
         with torch.no_grad():
             embeddings = self.embedding_model.encode(
                 texts, normalize_embeddings=True, convert_to_numpy=True
@@ -280,6 +281,8 @@ class MonolithicPipeline:
         self, queries: List[str], documents_batch: List[List[Dict]]
     ) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
+        if self.reranker_model is None or self.reranker_tokenizer is None:
+            raise RuntimeError("Reranker model not loaded on this node")
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -306,6 +309,8 @@ class MonolithicPipeline:
         self, queries: List[str], documents_batch: List[List[Dict]]
     ) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
+        if self.llm_model is None or self.llm_tokenizer is None:
+            raise RuntimeError("LLM model not loaded on this node")
         responses = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join(
@@ -327,7 +332,7 @@ class MonolithicPipeline:
             model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(
                 self.device
             )
-            generated_ids = model.generate(
+            generated_ids = self.llm_model.generate(
                 **model_inputs,
                 max_new_tokens=CONFIG["max_tokens"],
                 temperature=0.01,
@@ -337,9 +342,9 @@ class MonolithicPipeline:
                 output_ids[len(input_ids) :]
                 for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[
-                0
-            ]
+            response = self.llm_tokenizer.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
             responses.append(response)
         return responses
 
@@ -352,7 +357,7 @@ class MonolithicPipeline:
                 device=self.device,
             )
         truncated_texts = [text[: CONFIG["truncate_length"]] for text in texts]
-        raw_results = classifier(truncated_texts)
+        raw_results = self.sentiment_classifier(truncated_texts)
         sentiment_map = {
             "1 star": "very negative",
             "2 stars": "negative",
