@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 import faiss
+import requests as http_requests
 import sqlite3
 from typing import List, Dict, Any
 from dataclasses import dataclass
@@ -329,82 +330,6 @@ class MonolithicPipeline:
         return toxicity_flags
 
 
-# Global pipeline instance
-pipeline = None
-
-
-def process_requests_worker():
-    """Worker thread that processes requests from the queue"""
-    global pipeline
-    while True:
-        try:
-            request_data = request_queue.get()
-            if request_data is None:  # Shutdown signal
-                break
-
-            # Create request object
-            req = PipelineRequest(
-                request_id=request_data["request_id"],
-                query=request_data["query"],
-                timestamp=time.time(),
-            )
-
-            # Process request
-            response = pipeline.process_request(req)
-
-            # Store result
-            with results_lock:
-                results[request_data["request_id"]] = {
-                    "request_id": response.request_id,
-                    "generated_response": response.generated_response,
-                    "sentiment": response.sentiment,
-                    "is_toxic": response.is_toxic,
-                }
-
-            request_queue.task_done()
-        except Exception as e:
-            print(f"Error processing request: {e}")
-            request_queue.task_done()
-
-
-@app.route("/query", methods=["POST"])
-def handle_query():
-    """Handle incoming query requests"""
-    try:
-        data = request.json
-        request_id = data.get("request_id")
-        query = data.get("query")
-
-        if not request_id or not query:
-            return jsonify({"error": "Missing request_id or query"}), 400
-
-        # Check if result already exists (request already processed)
-        with results_lock:
-            if request_id in results:
-                return jsonify(results[request_id]), 200
-
-        print(f"queueing request {request_id}")
-        # Add to queue
-        request_queue.put({"request_id": request_id, "query": query})
-
-        # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
-        timeout = 300  # 5 minutes
-        start_wait = time.time()
-        while True:
-            with results_lock:
-                if request_id in results:
-                    result = results.pop(request_id)
-                    return jsonify(result), 200
-
-            if time.time() - start_wait > timeout:
-                return jsonify({"error": "Request timeout"}), 504
-
-            time.sleep(0.1)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint"""
@@ -416,6 +341,109 @@ def health():
 
 def run_gateway():
     # current queue/worker + /query routes
+    print("Initializing pipeline...")
+    pipeline = MonolithicPipeline()
+
+    def process_requests_worker():
+        """Worker thread that processes requests from the queue"""
+        while True:
+            try:
+                request_data = request_queue.get()
+                if request_data is None:  # Shutdown signal
+                    break
+
+                # Create request object
+                req = PipelineRequest(
+                    request_id=request_data["request_id"],
+                    query=request_data["query"],
+                    timestamp=time.time(),
+                )
+                query_embeddings = pipeline._generate_embeddings_batch(
+                    [request_data["query"]]
+                )
+
+                # Call Node 1
+                node1_response = http_requests.post(
+                    f"http://{NODE_1_IP}/retrieve",
+                    json={
+                        "request_id": request_data["request_id"],
+                        "query": request_data["query"],
+                        "embeddings": query_embeddings.tolist(),
+                    },
+                    timeout=300,
+                )
+                node1_data = node1_response.json()
+
+                # Call Node 2
+                node2_response = http_requests.post(
+                    f"http://{NODE_2_IP}/generate",
+                    json={
+                        "request_id": request_data["request_id"],
+                        "query": request_data["query"],
+                        "documents": node1_data["documents"],
+                    },
+                    timeout=300,
+                )
+                node2_data = node2_response.json()
+
+                # Store result
+                with results_lock:
+                    results[request_data["request_id"]] = {
+                        "request_id": request_data[
+                            "request_id"
+                        ],  # Use original request_id
+                        "generated_response": node2_data["generated_response"],
+                        "sentiment": node2_data["sentiment"],
+                        "is_toxic": node2_data["is_toxic"],
+                    }
+
+                request_queue.task_done()
+            except Exception as e:
+                print(f"Error processing request: {e}")
+                request_queue.task_done()
+
+    worker_thread = threading.Thread(target=process_requests_worker, daemon=True)
+    worker_thread.start()
+    print("Worker thread started!")
+    app = Flask("gateway")
+
+    @app.route("/query", methods=["POST"])
+    def handle_query():
+        """Handle incoming query requests"""
+        try:
+            data = request.json
+            request_id = data.get("request_id")
+            query = data.get("query")
+
+            if not request_id or not query:
+                return jsonify({"error": "Missing request_id or query"}), 400
+
+            # Check if result already exists (request already processed)
+            with results_lock:
+                if request_id in results:
+                    return jsonify(results[request_id]), 200
+
+            print(f"queueing request {request_id}")
+            # Add to queue
+            request_queue.put({"request_id": request_id, "query": query})
+
+            # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
+            timeout = 300  # 5 minutes
+            start_wait = time.time()
+            while True:
+                with results_lock:
+                    if request_id in results:
+                        result = results.pop(request_id)
+                        return jsonify(result), 200
+
+                if time.time() - start_wait > timeout:
+                    return jsonify({"error": "Request timeout"}), 504
+
+                time.sleep(0.1)
+
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     host = NODE_0_IP.split(":")[0]
     port = int(NODE_0_IP.split(":")[1]) if ":" in NODE_0_IP else 8000
     app.run(host=host, port=port, threaded=True)
@@ -423,10 +451,29 @@ def run_gateway():
 
 def run_retriever():
     app = Flask("retriever")
+    pipeline = MonolithicPipeline()
 
     @app.route("/retrieve", methods=["POST"])
     def retrieve():
-        return jsonify({"error": "stub"}), 501
+        data = request.json
+        request_ids = [data.get("request_id")]
+        queries = [data.get("query")]
+        embeddings = data.get("embeddings")
+        if not isinstance(embeddings, list):
+            embeddings = [embeddings]  # Handle single embedding case
+        embeddings_array = np.array(embeddings, dtype=np.float32)
+
+        doc_id_batches = pipeline._faiss_search_batch(embeddings_array)
+        documents_batch = pipeline._fetch_documents_batch(doc_id_batches)
+        reranked_docs_batch = pipeline._rerank_documents_batch(queries, documents_batch)
+        return (
+            jsonify(
+                {
+                    "documents": reranked_docs_batch  # List of document lists, one per request
+                }
+            ),
+            200,
+        )
 
     @app.route("/health", methods=["GET"])
     def retriever_health():
@@ -437,10 +484,48 @@ def run_retriever():
 
 def run_generator():
     app = Flask("generator")
+    pipeline = MonolithicPipeline()
 
     @app.route("/generate", methods=["POST"])
     def generate():
-        return jsonify({"error": "stub"}), 501
+
+        data = request.json
+        request_id = [data.get("request_id")]
+        query = [data.get("query")]
+        documents = data.get("documents")
+        # Ensure it's a list of lists
+        if documents and not isinstance(documents[0], list):
+            documents = [documents]  # Wrap single document list
+        responses_text = pipeline._generate_responses_batch(query, documents)
+        sentiments = pipeline._analyze_sentiment_batch(responses_text)
+        toxicity_flags = pipeline._filter_response_safety_batch(responses_text)
+        return (
+            jsonify(
+                {
+                    "request_id": (
+                        request_id[0] if isinstance(request_id, list) else request_id
+                    ),  # Single value
+                    "generated_response": (
+                        responses_text[0]
+                        if isinstance(responses_text, list)
+                        else responses_text
+                    ),
+                    "sentiment": (
+                        sentiments[0] if isinstance(sentiments, list) else sentiments
+                    ),
+                    "is_toxic": (
+                        "true"
+                        if (
+                            toxicity_flags[0]
+                            if isinstance(toxicity_flags, list)
+                            else toxicity_flags
+                        )
+                        else "false"
+                    ),
+                }
+            ),
+            200,
+        )
 
     @app.route("/health", methods=["GET"])
     def generator_health():
