@@ -362,7 +362,7 @@ def run_gateway():
     def process_requests_worker():
         """Worker thread that processes requests from the queue"""
         BATCH_SIZE = 4
-        BATCH_TIMEOUT = 300
+        BATCH_TIMEOUT = 60
         while True:
             try:
                 batch = []
