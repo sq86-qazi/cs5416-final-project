@@ -1,0 +1,12 @@
+2025-12-09 16:45:59,655 INFO Use pytorch device_name: mps
+2025-12-09 16:45:59,658 INFO Load pretrained SentenceTransformer: BAAI/bge-base-en-v1.5
+2025-12-09 16:46:01,272 INFO [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://10.48.42.217:8000
+2025-12-09 16:46:01,310 INFO [33mPress CTRL+C to quit[0m
+2025-12-09 16:51:11,056 INFO 10.48.42.217 - - [09/Dec/2025 16:51:11] "GET /health HTTP/1.1" 200 -
+2025-12-09 16:53:54,412 INFO Use pytorch device_name: mps
+2025-12-09 16:53:54,412 INFO Load pretrained SentenceTransformer: BAAI/bge-base-en-v1.5
+2025-12-09 16:53:55,817 INFO [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://10.48.42.217:8000
+2025-12-09 16:53:55,817 INFO [33mPress CTRL+C to quit[0m
+2025-12-09 16:54:18,104 INFO 10.48.42.217 - - [09/Dec/2025 16:54:18] "GET /health HTTP/1.1" 200 -

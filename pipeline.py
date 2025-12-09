@@ -22,6 +22,13 @@ from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
 from queue import Queue
 import threading
+import logging
+import resource
+
+try:
+    import psutil
+except ImportError:  # graceful fallback if psutil is absent
+    psutil = None
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 1))
@@ -31,6 +38,20 @@ NODE_1_IP = os.environ.get("NODE_1_IP", "localhost:8000")
 NODE_2_IP = os.environ.get("NODE_2_IP", "localhost:8000")
 FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "faiss_index.bin")
 DOCUMENTS_DIR = os.environ.get("DOCUMENTS_DIR", "documents/")
+
+# Logging setup
+LOG_DIR = os.environ.get("LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"node{NODE_NUMBER}.log")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, mode="a"),
+            logging.StreamHandler(),
+        ],
+    )
 
 # Configuration
 CONFIG = {
@@ -49,6 +70,34 @@ app = Flask(__name__)
 request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
+
+
+def log_profile(tag: str, extra: str = ""):
+    """
+    Lightweight profiling helper. Logs RSS (if psutil present) and max RSS,
+    plus an optional extra string for timing info.
+    """
+    mem_gb = None
+    if psutil:
+        try:
+            mem_gb = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+        except Exception:
+            mem_gb = None
+
+    try:
+        # ru_maxrss is kilobytes on Linux, bytes on macOS; normalize to GB.
+        max_rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Heuristic: if value is very large, assume bytes; otherwise KB.
+        if max_rss_raw > 10**9:
+            max_rss_gb = max_rss_raw / (1024**3)
+        else:
+            max_rss_gb = max_rss_raw / (1024**2)
+    except Exception:
+        max_rss_gb = None
+
+    mem_part = f"mem={mem_gb:.2f}GB " if mem_gb is not None else ""
+    max_part = f"max={max_rss_gb:.2f}GB " if max_rss_gb is not None else ""
+    logging.info(f"[profile][{tag}] {mem_part}{max_part}{extra}")
 
 
 @dataclass
@@ -398,8 +447,11 @@ def run_gateway():
                 request_ids = [req["request_id"] for req in batch]
                 queries = [req["query"] for req in batch]
 
+                t0 = time.perf_counter()
                 # Step 1: Generate embeddings for batch
                 query_embeddings = pipeline._generate_embeddings_batch(queries)
+                t1 = time.perf_counter()
+
                 # Call Node 1
                 node1_response = http_requests.post(
                     f"http://{NODE_1_IP}/retrieve",
@@ -411,6 +463,7 @@ def run_gateway():
                     timeout=300,
                 )
                 node1_data = node1_response.json()
+                t2 = time.perf_counter()
 
                 # Call Node 2
                 node2_response = http_requests.post(
@@ -423,6 +476,7 @@ def run_gateway():
                     timeout=300,
                 )
                 node2_data = node2_response.json()
+                t3 = time.perf_counter()
 
                 # Store result
                 with results_lock:
@@ -444,6 +498,12 @@ def run_gateway():
                             "sentiment": node2_data["sentiment"],
                             "is_toxic": node2_data["is_toxic"],
                         }
+
+                batch_info = (
+                    f"batch={len(batch)} emb={t1 - t0:.3f}s "
+                    f"n1={t2 - t1:.3f}s n2={t3 - t2:.3f}s total={t3 - t0:.3f}s"
+                )
+                log_profile("node0", batch_info)
 
                 # Mark all tasks as done
                 for _ in batch:
@@ -526,9 +586,18 @@ def run_retriever():
             embeddings_list = [data.get("embeddings")]
         embeddings_array = np.array(embeddings_list, dtype=np.float32)
 
+        t0 = time.perf_counter()
         doc_id_batches = pipeline._faiss_search_batch(embeddings_array)
+        t1 = time.perf_counter()
         documents_batch = pipeline._fetch_documents_batch(doc_id_batches)
+        t2 = time.perf_counter()
         reranked_docs_batch = pipeline._rerank_documents_batch(queries, documents_batch)
+        t3 = time.perf_counter()
+        log_profile(
+            "node1",
+            f"batch={len(request_ids)} faiss={t1 - t0:.3f}s "
+            f"fetch={t2 - t1:.3f}s rerank={t3 - t2:.3f}s total={t3 - t0:.3f}s",
+        )
         return (
             jsonify(
                 {
@@ -567,9 +636,18 @@ def run_generator():
                 documents_batch = [documents]
             else:
                 documents_batch = [documents] if documents else [[]]
+        t0 = time.perf_counter()
         responses_text = pipeline._generate_responses_batch(queries, documents_batch)
+        t1 = time.perf_counter()
         sentiments = pipeline._analyze_sentiment_batch(responses_text)
+        t2 = time.perf_counter()
         toxicity_flags = pipeline._filter_response_safety_batch(responses_text)
+        t3 = time.perf_counter()
+        log_profile(
+            "node2",
+            f"batch={len(request_ids)} llm={t1 - t0:.3f}s "
+            f"sentiment={t2 - t1:.3f}s safety={t3 - t2:.3f}s total={t3 - t0:.3f}s",
+        )
         is_toxic_list = ["true" if flag else "false" for flag in toxicity_flags]
 
         # Return batch response
