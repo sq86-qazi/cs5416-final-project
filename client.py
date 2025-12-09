@@ -45,7 +45,7 @@ def send_request_async(request_id: str, query: str, send_time: float):
         payload = {"request_id": request_id, "query": query}
 
         start_time = time.time()
-        response = requests.post(SERVER_URL, json=payload, timeout=300)
+        response = requests.post(SERVER_URL, json=payload, timeout=1000)
         elapsed_time = time.time() - start_time
 
         if response.status_code == 200:
@@ -138,9 +138,9 @@ def main():
     threads = []
 
     # Send 6 requests at 10-second intervals
-    for i in range(8):
+    for i in range(24):
         # Calculate when this request should be sent
-        target_send_time = start_time + (i * 10)
+        target_send_time = start_time + (i * 5)
 
         # Wait until the target send time
         current_time = time.time()
@@ -168,7 +168,7 @@ def main():
     # Wait for all threads to complete (with a reasonable timeout)
     print(f"\n\nWaiting for all responses (up to 5 minutes)...")
     for thread in threads:
-        thread.join(timeout=320)  # 5 min 20 sec to allow for some buffer
+        thread.join(timeout=1000)  # 5 min 20 sec to allow for some buffer
 
     # Print summary
     total_time = time.time() - start_time

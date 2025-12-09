@@ -460,7 +460,7 @@ def run_gateway():
                         "queries": queries,
                         "embeddings": query_embeddings.tolist(),
                     },
-                    timeout=300,
+                    timeout=1000,
                 )
                 node1_data = node1_response.json()
                 t2 = time.perf_counter()
@@ -473,7 +473,7 @@ def run_gateway():
                         "queries": queries,
                         "documents": node1_data["documents"],  # List of document lists
                     },
-                    timeout=300,
+                    timeout=1000,
                 )
                 node2_data = node2_response.json()
                 t3 = time.perf_counter()
@@ -538,7 +538,7 @@ def run_gateway():
             request_queue.put({"request_id": request_id, "query": query})
 
             # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
-            timeout = 300  # 5 minutes
+            timeout = 1000  # 5 minutes
             start_wait = time.time()
             while True:
                 with results_lock:
